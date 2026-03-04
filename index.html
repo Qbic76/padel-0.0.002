@@ -1,0 +1,1001 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Padel 2v2 Prototip</title>
+  <style>
+    :root {
+      --bg1: #0e1a22;
+      --bg2: #112f35;
+      --court: #2a8c8f;
+      --line: #d9f3f2;
+      --glass: #b9dbe280;
+      --net: #f3f3f3;
+      --team-a: #f4d400;
+      --team-b: #102a54;
+      --accent: #ff5f5f;
+      --ok: #87f091;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: radial-gradient(circle at 20% 20%, #1d3d48 0%, var(--bg1) 60%),
+                  linear-gradient(145deg, var(--bg2), var(--bg1));
+      color: #f0f6f8;
+      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+      display: grid;
+      place-items: center;
+      padding: 16px;
+    }
+
+    .wrap {
+      width: min(1100px, 96vw);
+      display: grid;
+      gap: 10px;
+    }
+
+    canvas {
+      width: 100%;
+      height: auto;
+      border-radius: 14px;
+      border: 2px solid #ffffff33;
+      background: #0a3137;
+      box-shadow: 0 10px 40px #00000055;
+      touch-action: none;
+      user-select: none;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <canvas id="game" width="900" height="1040"></canvas>
+  </div>
+
+  <script>
+    const canvas = document.getElementById("game");
+    const ctx = canvas.getContext("2d");
+
+    const court = {
+      x: 250,
+      y: 120,
+      w: 400,
+      h: 800,
+      netY: 120 + 800 / 2,
+      serviceHalfW: 400 / 2,
+      sideWallH: 88,
+      backWallH: 110,
+      line: 4
+    };
+
+    const meter = {
+      x: court.w / 10,
+      y: court.h / 20
+    };
+
+    const GRAVITY = -24;
+    const DT = 1 / 60;
+    const TIME_SCALE = 1 / 3;
+    const SIM_DT = DT * TIME_SCALE;
+    const MOVE_SPEED = 6.5;
+    const PLAYER_SPEED_MULT = 1.875;
+    const BOT_SPEED_MULT = 1.3;
+    const HIT_REACH = 34;
+
+    const SCORE_ORDER = [0, 15, 30, 40];
+    const TEAM_COLORS = ["#ff8c1a", "#2fbf49"];
+
+    const state = {
+      players: [],
+      ball: null,
+      controlId: 0,
+      prediction: null,
+      servingTeam: 0,
+      serveSideRight: true,
+      serveFaults: 0,
+      phase: "serve_setup",
+      points: [0, 0],
+      games: [0, 0],
+      sets: [0, 0],
+      setOver: false,
+      info: "Servis hazırlığı",
+      clickFeedback: "",
+      bounceCountBySideSinceHit: [0, 0],
+      firstBounceVzBySide: [0, 0],
+      lastHitTeam: null,
+      lastBounceTeam: null,
+      bouncePuffs: [],
+      hitPuffs: [],
+      wallPuffs: [],
+      pendingPoint: null,
+      returnRule: { active: false, strikerTeam: null, opponentBounceSeen: false },
+      simTime: 0,
+      lastBounceFxTime: -999,
+      serverPlayerByTeam: [0, 2],
+      rallyUnlockTime: 0
+    };
+
+    function mkPlayers() {
+      state.players = [
+        { id: 0, name: "Sen", team: 0, x: court.x + court.w * 0.28, y: court.y + court.h * 0.78, tx: 0, ty: 0, speed: MOVE_SPEED * PLAYER_SPEED_MULT, isBot: false, side: "bottom" },
+        { id: 1, name: "Bot A", team: 0, x: court.x + court.w * 0.72, y: court.y + court.h * 0.72, tx: 0, ty: 0, speed: MOVE_SPEED * 0.95 * BOT_SPEED_MULT, isBot: true, side: "bottom" },
+        { id: 2, name: "Bot B", team: 1, x: court.x + court.w * 0.30, y: court.y + court.h * 0.26, tx: 0, ty: 0, speed: MOVE_SPEED * 0.98 * BOT_SPEED_MULT, isBot: true, side: "top" },
+        { id: 3, name: "Bot C", team: 1, x: court.x + court.w * 0.70, y: court.y + court.h * 0.20, tx: 0, ty: 0, speed: MOVE_SPEED * 0.92 * BOT_SPEED_MULT, isBot: true, side: "top" }
+      ];
+      for (const p of state.players) {
+        p.homeX = p.x;
+        p.homeY = p.y;
+        p.laneMinX = p.x < court.x + court.w / 2 ? court.x + 12 : court.x + court.w / 2 + 12;
+        p.laneMaxX = p.x < court.x + court.w / 2 ? court.x + court.w / 2 - 12 : court.x + court.w - 12;
+        p.tx = p.x;
+        p.ty = p.y;
+      }
+    }
+
+    function resetBallForServe() {
+      const server = servingPlayer();
+      state.ball = {
+        x: server.x + 16,
+        y: server.y - 6,
+        z: 1.0,
+        vx: 0,
+        vy: 0,
+        vz: 0,
+        inPlay: false,
+        justBounced: false,
+        wasGrounded: false
+      };
+      state.phase = "serve_setup";
+      state.info = `${teamName(state.servingTeam)} serviste (${state.serveSideRight ? "sağ" : "sol"}) - başlatmak için tıkla`;
+      state.bounceCountBySideSinceHit = [0, 0];
+      state.firstBounceVzBySide = [0, 0];
+      state.lastHitTeam = null;
+      state.lastBounceTeam = null;
+      state.prediction = null;
+      state.bouncePuffs = [];
+      state.hitPuffs = [];
+      state.wallPuffs = [];
+      state.pendingPoint = null;
+      state.returnRule = { active: false, strikerTeam: null, opponentBounceSeen: false };
+      state.lastBounceFxTime = -999;
+      state.rallyUnlockTime = state.simTime;
+    }
+
+    function servingPlayer(team = state.servingTeam, right = state.serveSideRight) {
+      void right;
+      return state.players[state.serverPlayerByTeam[team]];
+    }
+
+    function receivingTeam() {
+      return state.servingTeam === 0 ? 1 : 0;
+    }
+
+    function teamName(team) {
+      return team === 0 ? "Turuncu" : "Yeşil";
+    }
+
+    function updateHUD() {
+      // HUD kaldırıldı; skor kort içine çiziliyor.
+    }
+
+    function padelPointText(team) {
+      const own = state.points[team];
+      const opp = state.points[team === 0 ? 1 : 0];
+      if (own >= 3 && opp >= 3) {
+        if (own === opp) return "Deuce";
+        if (own === opp + 1) return "Adv";
+        return "40";
+      }
+      return String(SCORE_ORDER[Math.min(own, 3)]);
+    }
+
+    function awardPoint(teamWon, why) {
+      state.info = `${teamName(teamWon)} sayı aldı (${why})`;
+      state.points[teamWon] += 1;
+      // Servis yönü her sayıda sağ/sol değişir.
+      state.serveSideRight = !state.serveSideRight;
+      const a = state.points[0];
+      const b = state.points[1];
+
+      const gameWon = (() => {
+        if (a >= 4 || b >= 4) {
+          const lead = Math.abs(a - b);
+          if (lead >= 2) return a > b ? 0 : 1;
+        }
+        return -1;
+      })();
+
+      if (gameWon !== -1) {
+        state.games[gameWon] += 1;
+        state.points = [0, 0];
+        state.serveSideRight = true;
+        // Game bitince servis diğer takıma geçer.
+        const nextServingTeam = state.servingTeam === 0 ? 1 : 0;
+        state.servingTeam = nextServingTeam;
+        // Yeni servis game'inde servisçi takım içinden değişsin.
+        if (nextServingTeam === 0) {
+          state.serverPlayerByTeam[0] = state.serverPlayerByTeam[0] === 0 ? 1 : 0;
+        } else {
+          state.serverPlayerByTeam[1] = state.serverPlayerByTeam[1] === 2 ? 3 : 2;
+        }
+        state.serveFaults = 0;
+        state.info = `${teamName(gameWon)} game kazandı`;
+
+        const gA = state.games[0];
+        const gB = state.games[1];
+        const setWon = (() => {
+          if ((gA >= 6 || gB >= 6) && Math.abs(gA - gB) >= 2) return gA > gB ? 0 : 1;
+          if (gA === 7 || gB === 7) return gA > gB ? 0 : 1;
+          return -1;
+        })();
+        if (setWon !== -1) {
+          state.sets[setWon] += 1;
+          state.games = [0, 0];
+          state.info = `${teamName(setWon)} set kazandı`;
+        }
+      }
+
+      resetToFormation();
+      resetBallForServe();
+    }
+
+    function queuePoint(teamWon, why) {
+      if (state.pendingPoint) return;
+      state.pendingPoint = {
+        teamWon,
+        why,
+        timeLeft: 1.0
+      };
+      state.returnRule.active = false;
+      state.info = `Sayı beklemede: ${teamName(teamWon)} (${why})`;
+    }
+
+    function resetToFormation() {
+      const xL = court.x + court.w * 0.30;
+      const xR = court.x + court.w * 0.70;
+      const yBottomBack = court.y + court.h * 0.86;
+      const yBottomMate = court.y + court.h * 0.82;
+      const yTopBack = court.y + court.h * 0.14;
+      const yTopMate = court.y + court.h * 0.18;
+
+      // Varsayılan: karşılayan takım klasik dizilim.
+      state.players[0].x = xL; state.players[0].y = yBottomMate;
+      state.players[1].x = xR; state.players[1].y = yBottomMate;
+      state.players[2].x = xL; state.players[2].y = yTopMate;
+      state.players[3].x = xR; state.players[3].y = yTopMate;
+
+      // Servis atan takım: aynı servisçi oyun boyunca sağ/sol değiştirerek atar.
+      if (state.servingTeam === 0) {
+        const serverId = state.serverPlayerByTeam[0];
+        const mateId = serverId === 0 ? 1 : 0;
+        const serverX = state.serveSideRight ? xR : xL;
+        const mateX = state.serveSideRight ? xL : xR;
+        state.players[serverId].x = serverX; state.players[serverId].y = yBottomBack;
+        state.players[mateId].x = mateX; state.players[mateId].y = yBottomMate;
+      } else {
+        const serverId = state.serverPlayerByTeam[1];
+        const mateId = serverId === 2 ? 3 : 2;
+        // Üst takım için sağ servis ekranın solu.
+        const serverX = state.serveSideRight ? xL : xR;
+        const mateX = state.serveSideRight ? xR : xL;
+        state.players[serverId].x = serverX; state.players[serverId].y = yTopBack;
+        state.players[mateId].x = mateX; state.players[mateId].y = yTopMate;
+      }
+
+      for (const p of state.players) {
+        p.homeX = p.x;
+        p.homeY = p.y;
+        p.laneMinX = p.x < court.x + court.w / 2 ? court.x + 12 : court.x + court.w / 2 + 12;
+        p.laneMaxX = p.x < court.x + court.w / 2 ? court.x + court.w / 2 - 12 : court.x + court.w - 12;
+        p.tx = p.x;
+        p.ty = p.y;
+      }
+    }
+
+    function insideCourt(x, y) {
+      return x >= court.x && x <= court.x + court.w && y >= court.y && y <= court.y + court.h;
+    }
+
+    function movementBoundsFor(player) {
+      const minX = court.x + 10;
+      const maxX = court.x + court.w - 10;
+      if (player.team === 0) {
+        return { minX, maxX, minY: court.netY + 8, maxY: court.y + court.h - 10 };
+      }
+      return { minX, maxX, minY: court.y + 10, maxY: court.netY - 8 };
+    }
+
+    function teamForY(y) {
+      return y > court.netY ? 0 : 1;
+    }
+
+    function launchBallToward(ball, tx, ty, arc = 3.5, power = 1) {
+      const dx = tx - ball.x;
+      const dy = ty - ball.y;
+      const dist = Math.max(1, Math.hypot(dx, dy));
+      const t = Math.max(0.42, Math.min(1.2, dist / (430 * power)));
+      ball.vx = dx / t;
+      ball.vy = dy / t;
+      ball.vz = (arc - ball.z - 0.5 * GRAVITY * t * t) / t;
+      ball.inPlay = true;
+    }
+
+    function startServe() {
+      const server = servingPlayer();
+      const right = state.serveSideRight;
+      const isBottom = server.team === 0;
+
+      const target = serviceTargetFor(server.team, right);
+      state.ball.x = server.x + (right ? 10 : -10);
+      state.ball.y = server.y + (isBottom ? -8 : 8);
+      state.ball.z = 0.5;
+      state.ball.wasGrounded = false;
+
+      launchBallToward(state.ball, target.x, target.y, 2.4, 0.95);
+      state.phase = "serve_flight";
+      state.info = `${teamName(server.team)} servis attı`;
+      state.lastHitTeam = server.team;
+      state.bounceCountBySideSinceHit = [0, 0];
+      state.firstBounceVzBySide = [0, 0];
+      state.returnRule = { active: true, strikerTeam: server.team, opponentBounceSeen: false };
+      state.prediction = predictFirstBounce(state.ball);
+    }
+
+    function serviceTargetFor(serverTeam, right) {
+      const boxCenterY = serverTeam === 0
+        ? court.y + court.h * 0.35
+        : court.y + court.h * 0.65;
+      let x;
+      if (serverTeam === 0) {
+        x = right ? court.x + court.w * 0.25 : court.x + court.w * 0.75;
+      } else {
+        x = right ? court.x + court.w * 0.75 : court.x + court.w * 0.25;
+      }
+      return { x, y: boxCenterY };
+    }
+
+    function isInCorrectServiceBox(x, y, serverTeam, right) {
+      let left;
+      let rightX;
+      if (serverTeam === 0) {
+        left = right ? court.x : court.x + court.w / 2;
+        rightX = right ? court.x + court.w / 2 : court.x + court.w;
+      } else {
+        left = right ? court.x + court.w / 2 : court.x;
+        rightX = right ? court.x + court.w : court.x + court.w / 2;
+      }
+      if (x < left || x > rightX) return false;
+      if (serverTeam === 0) {
+        return y >= court.y && y <= court.netY;
+      }
+      return y >= court.netY && y <= court.y + court.h;
+    }
+
+    function predictFirstBounce(ball) {
+      const sim = { ...ball };
+      for (let i = 0; i < 300; i++) {
+        sim.vz += GRAVITY * SIM_DT;
+        sim.x += sim.vx * SIM_DT;
+        sim.y += sim.vy * SIM_DT;
+        sim.z += sim.vz * SIM_DT;
+
+        const left = court.x;
+        const right = court.x + court.w;
+        const top = court.y;
+        const bottom = court.y + court.h;
+
+        if (sim.x <= left || sim.x >= right) {
+          if (sim.z <= court.sideWallH / meter.y) sim.vx *= -0.86;
+          else return { x: sim.x, y: sim.y, valid: false };
+        }
+        if (sim.y <= top || sim.y >= bottom) {
+          if (sim.z <= court.backWallH / meter.y) sim.vy *= -0.86;
+          else return { x: sim.x, y: sim.y, valid: false };
+        }
+
+        if (sim.z <= 0) {
+          return { x: sim.x, y: sim.y, valid: insideCourt(sim.x, sim.y) };
+        }
+      }
+      return null;
+    }
+
+    function updatePlayers() {
+      const ball = state.ball;
+      const serveTarget = serviceTargetFor(state.servingTeam, state.serveSideRight);
+      let serveReceiverId = -1;
+      if (state.phase === "serve_flight") {
+        const recvTeam = receivingTeam();
+        let best = Infinity;
+        for (const rp of state.players) {
+          if (!rp.isBot || rp.team !== recvTeam) continue;
+          const d = Math.abs((rp.homeX ?? rp.x) - serveTarget.x);
+          if (d < best) {
+            best = d;
+            serveReceiverId = rp.id;
+          }
+        }
+      }
+
+      for (const p of state.players) {
+        if (p.isBot) {
+          const defendY = p.homeY || (p.side === "bottom" ? court.y + court.h * 0.74 : court.y + court.h * 0.24);
+          const defendX = p.homeX || (p.id % 2 === 0 ? court.x + court.w * 0.33 : court.x + court.w * 0.67);
+          p.tx = defendX;
+          p.ty = defendY;
+          const laneMin = p.laneMinX ?? (court.x + 20);
+          const laneMax = p.laneMaxX ?? (court.x + court.w - 20);
+          const ownSide = teamForY(ball.y) === p.team;
+          const dBall = Math.hypot(p.x - ball.x, p.y - ball.y);
+
+          // Servis karşılamada tek bot, topun ilk sekmesinden sonraki karşılık için önceden pozisyon alır.
+          if (state.phase === "serve_flight") {
+            if (p.id === serveReceiverId) {
+              const cornerX = serveTarget.x < court.x + court.w / 2 ? laneMin + 10 : laneMax - 10;
+              p.tx = clamp(cornerX, laneMin, laneMax);
+              // Servis karşılarken fileye koşma: arkada bekle.
+              p.ty = clamp(defendY + (p.team === 0 ? 24 : -24), court.y + 20, court.y + court.h - 20);
+            }
+          } else if (
+            state.phase === "rally" &&
+            ownSide &&
+            state.lastHitTeam === state.servingTeam &&
+            state.bounceCountBySideSinceHit[p.team] >= 1
+          ) {
+            // Servis dönüşünde ilk sekmeden sonra da arkada kalıp vur.
+            p.tx = clamp(ball.x, laneMin + 4, laneMax - 4);
+            p.ty = clamp(defendY + (p.team === 0 ? 18 : -18), court.y + 20, court.y + court.h - 20);
+          } else if (state.phase === "rally") {
+            // Daha doğal görünüm: botlar rallide pozisyon alır, topa doğru kayar.
+            const tLook = Math.min(0.35, 0.12 + dBall / 900);
+            const chaseX = ball.x + ball.vx * tLook;
+            const chaseY = ball.y + ball.vy * tLook;
+            const laneMid = (laneMin + laneMax) * 0.5;
+            const roamX = Math.sin(state.simTime * 1.9 + p.id * 0.8) * 10;
+            const roamY = Math.cos(state.simTime * 1.6 + p.id * 0.7) * 6;
+
+            if (!ownSide) {
+              // Top rakip sahadayken öne koşma; savunma düzenini koru.
+              p.tx = clamp(defendX + roamX * 0.45 + (laneMid - defendX) * 0.05, laneMin, laneMax);
+              p.ty = clamp(defendY + roamY * 0.4, court.y + 20, court.y + court.h - 20);
+            } else {
+              let mix = 0.55;
+              if (ball.z > 2.2) mix *= 0.75;
+              if (dBall < 170) mix = Math.min(0.75, mix + 0.18);
+              const targetX = defendX * (1 - mix) + chaseX * mix;
+              const targetY = defendY * (1 - mix) + chaseY * mix;
+              p.tx = clamp(targetX + roamX + (laneMid - defendX) * 0.08, laneMin, laneMax);
+              p.ty = clamp(targetY + roamY, court.y + 20, court.y + court.h - 20);
+            }
+          }
+        }
+
+        const bnd = movementBoundsFor(p);
+        p.tx = clamp(p.tx, bnd.minX, bnd.maxX);
+        p.ty = clamp(p.ty, bnd.minY, bnd.maxY);
+
+        const dx = p.tx - p.x;
+        const dy = p.ty - p.y;
+        const d = Math.hypot(dx, dy);
+        if (d > 1) {
+          const step = p.speed * meter.x * SIM_DT * 0.20;
+          const k = Math.min(1, step / d);
+          p.x += dx * k;
+          p.y += dy * k;
+        }
+        p.x = clamp(p.x, bnd.minX, bnd.maxX);
+        p.y = clamp(p.y, bnd.minY, bnd.maxY);
+      }
+
+      if (!ball.inPlay && state.phase === "serve_setup") {
+        const s = servingPlayer();
+        const sideSign = state.serveSideRight ? 1 : -1;
+        state.ball.x = s.x + sideSign * 16;
+        state.ball.y = s.y + (s.team === 0 ? -6 : 6);
+      }
+    }
+
+    function attemptHit(player) {
+      const b = state.ball;
+      if (!b.inPlay) return false;
+      if (state.phase === "serve_flight") return false;
+      if (state.simTime < state.rallyUnlockTime) return false;
+      if (state.pendingPoint) return false;
+      if (player.team === state.lastHitTeam) return false;
+
+      const d = Math.hypot(player.x - b.x, player.y - b.y);
+      const reachable = d <= HIT_REACH && b.z >= 0.05 && b.z <= 2.9;
+      if (!reachable) return false;
+
+      let targetX;
+      let targetY;
+      let arc = 3.2;
+
+      if (b.z > 2.2) {
+        targetX = clamp(court.x + court.w * (0.15 + Math.random() * 0.7), court.x + 20, court.x + court.w - 20);
+        targetY = player.team === 0 ? court.y + court.h * 0.08 : court.y + court.h * 0.92;
+        arc = 1.2;
+      } else {
+        targetX = clamp(court.x + court.w * (0.2 + Math.random() * 0.6), court.x + 25, court.x + court.w - 25);
+        targetY = player.team === 0
+          ? court.y + court.h * (0.12 + Math.random() * 0.30)
+          : court.y + court.h * (0.58 + Math.random() * 0.30);
+      }
+
+      // Oyuncu vuruş yönü: topun solundaysan sağa, sağındaysan sola yönlendir.
+      if (player.id === state.controlId) {
+        const sideDir = player.x < b.x ? 1 : -1;
+        const lateral = court.w * 0.28;
+        targetX = clamp(b.x + sideDir * lateral, court.x + 25, court.x + court.w - 25);
+      }
+
+      launchBallToward(b, targetX, targetY, arc, 1.0);
+      state.lastHitTeam = player.team;
+      state.bounceCountBySideSinceHit = [0, 0];
+      state.firstBounceVzBySide = [0, 0];
+      state.returnRule = { active: true, strikerTeam: player.team, opponentBounceSeen: false };
+      spawnHitPuffs(b.x, b.y, player.team);
+      state.prediction = predictFirstBounce(b);
+      return true;
+    }
+
+    function getReboundVz(incomingVz, side, bounceCountOnSide) {
+      const impact = Math.abs(incomingVz);
+      const firstRebound = Math.max(2.2, impact * 0.66 + 2.1);
+      if (bounceCountOnSide === 1) {
+        state.firstBounceVzBySide[side] = firstRebound;
+        return firstRebound;
+      }
+      if (bounceCountOnSide === 2) {
+        const first = state.firstBounceVzBySide[side] || firstRebound;
+        return Math.max(1.1, first * 0.5);
+      }
+      const second = Math.max(1.1, (state.firstBounceVzBySide[side] || firstRebound) * 0.5);
+      return Math.max(0.8, second * 0.58);
+    }
+
+    function updateBall() {
+      const b = state.ball;
+
+      if (state.phase === "serve_setup") {
+        return;
+      }
+
+      b.vz += GRAVITY * SIM_DT;
+      b.x += b.vx * SIM_DT;
+      b.y += b.vy * SIM_DT;
+      b.z += b.vz * SIM_DT;
+
+      b.justBounced = false;
+
+      const left = court.x;
+      const right = court.x + court.w;
+      const top = court.y;
+      const bottom = court.y + court.h;
+
+      // Rallyde topu oyunda tut: duvar seviyesini aşsa bile geri sektir.
+      if (b.x <= left && b.vx < 0) {
+        b.vx *= -0.72;
+        b.vy *= 0.90;
+        b.vz *= 0.92;
+        b.x = clamp(b.x, left + 1, right - 1);
+        spawnWallPuffs(b.x, b.y);
+      }
+      if (b.x >= right && b.vx > 0) {
+        b.vx *= -0.72;
+        b.vy *= 0.90;
+        b.vz *= 0.92;
+        b.x = clamp(b.x, left + 1, right - 1);
+        spawnWallPuffs(b.x, b.y);
+      }
+
+      if (b.y <= top && b.vy < 0) {
+        b.vy *= -0.72;
+        b.vx *= 0.90;
+        b.vz *= 0.92;
+        b.y = clamp(b.y, top + 1, bottom - 1);
+        spawnWallPuffs(b.x, b.y);
+      }
+      if (b.y >= bottom && b.vy > 0) {
+        b.vy *= -0.72;
+        b.vx *= 0.90;
+        b.vz *= 0.92;
+        b.y = clamp(b.y, top + 1, bottom - 1);
+        spawnWallPuffs(b.x, b.y);
+      }
+
+      // Fileye takılma yerine fileden yumuşak sekme ver; ani puan olmasın.
+      if (crossedNetWithoutHeight(b)) {
+        b.vy *= -0.70;
+        b.vz = Math.max(b.vz, 1.2);
+        spawnWallPuffs(b.x, court.netY);
+        b.y = clamp(b.y, top + 1, bottom - 1);
+      }
+
+      const groundedNow = b.z <= 0;
+      if (groundedNow && !b.wasGrounded) {
+        b.z = 0;
+        b.justBounced = true;
+        const teamSide = teamForY(b.y);
+        const impactVz = Math.abs(b.vz);
+        if (impactVz >= 1.0) {
+          state.bounceCountBySideSinceHit[teamSide] += 1;
+        }
+        state.lastBounceTeam = teamSide;
+        if (impactVz >= 2.6 && state.simTime - state.lastBounceFxTime > 0.12) {
+          spawnBouncePuffs(b.x, b.y);
+          state.lastBounceFxTime = state.simTime;
+        }
+        if (state.returnRule.active && state.returnRule.strikerTeam !== null && teamSide !== state.returnRule.strikerTeam) {
+          state.returnRule.opponentBounceSeen = true;
+        }
+
+        if (state.phase === "serve_flight") {
+          // Geçici mod: servis her zaman doğru kutuya kabul edilir.
+          state.phase = "rally";
+          state.rallyUnlockTime = state.simTime + 0.08;
+          state.serveFaults = 0;
+        }
+
+        if (state.bounceCountBySideSinceHit[teamSide] >= 2) {
+          const winner = teamSide === 0 ? 1 : 0;
+          queuePoint(winner, "ikinci sekme");
+          b.vx *= 0.96;
+          b.vy *= 0.96;
+        }
+
+        b.vz = getReboundVz(b.vz, teamSide, state.bounceCountBySideSinceHit[teamSide]);
+        b.vx *= 0.985;
+        b.vy *= 0.985;
+      }
+
+      // Puan yalnızca zeminin 2. sekmesinde biter; geri dönme kuralı erken bitirmez.
+      b.wasGrounded = groundedNow;
+
+      if (!state.pendingPoint) {
+        for (const p of state.players) {
+          if (attemptHit(p)) break;
+        }
+      }
+
+      state.prediction = predictFirstBounce(b);
+    }
+
+    function crossedNetWithoutHeight(ball) {
+      const prevY = ball.y - ball.vy * SIM_DT;
+      const wasAbove = prevY < court.netY;
+      const nowAbove = ball.y < court.netY;
+      if (wasAbove === nowAbove) return false;
+      const netH = 0.9;
+      return ball.z <= netH;
+    }
+
+    function drawCourt() {
+      const { x, y, w, h, line, netY } = court;
+
+      const g = ctx.createLinearGradient(x, y, x + w, y + h);
+      g.addColorStop(0, "#39a5a7");
+      g.addColorStop(1, "#227a7d");
+      ctx.fillStyle = g;
+      ctx.fillRect(x, y, w, h);
+
+      ctx.fillStyle = "#7dc3cf33";
+      ctx.fillRect(x - 12, y - 12, w + 24, h + 24);
+
+      ctx.strokeStyle = "#d9f3f2";
+      ctx.lineWidth = line;
+      ctx.strokeRect(x, y, w, h);
+
+      const metersToPx = h / 20;
+      const serviceTop = y + metersToPx * 3;
+      const serviceBottom = y + h - metersToPx * 3;
+
+      // Orta dikey çizgi sadece servis çizgileri ile file arasında olsun.
+      ctx.beginPath();
+      ctx.moveTo(x + w / 2, serviceTop);
+      ctx.lineTo(x + w / 2, netY);
+      ctx.moveTo(x + w / 2, netY);
+      ctx.lineTo(x + w / 2, serviceBottom);
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.moveTo(x, serviceTop);
+      ctx.lineTo(x + w, serviceTop);
+      ctx.moveTo(x, serviceBottom);
+      ctx.lineTo(x + w, serviceBottom);
+      ctx.stroke();
+
+      ctx.fillStyle = "#b9dbe266";
+      ctx.fillRect(x - 8, y - 8, 8, h + 16);
+      ctx.fillRect(x + w, y - 8, 8, h + 16);
+      ctx.fillRect(x - 8, y - 8, w + 16, 8);
+      ctx.fillRect(x - 8, y + h, w + 16, 8);
+
+      ctx.strokeStyle = "#f3f3f3";
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(x, netY);
+      ctx.lineTo(x + w, netY);
+      ctx.stroke();
+
+      ctx.fillStyle = "#f3f3f3";
+      for (let i = 0; i < 48; i++) {
+        const px = x + (w / 48) * i;
+        ctx.fillRect(px, netY - 3, 8, 6);
+      }
+    }
+
+    function spawnBouncePuffs(x, y) {
+      for (let i = 0; i < 7; i++) {
+        const a = (Math.PI * 2 * i) / 7 + (Math.random() - 0.5) * 0.25;
+        const speed = 18 + Math.random() * 22;
+        state.bouncePuffs.push({
+          x,
+          y,
+          vx: Math.cos(a) * speed,
+          vy: Math.sin(a) * speed * 0.4,
+          life: 0.35 + Math.random() * 0.15,
+          r: 4 + Math.random() * 3
+        });
+      }
+    }
+
+    function spawnHitPuffs(x, y, team) {
+      for (let i = 0; i < 8; i++) {
+        const a = (Math.PI * 2 * i) / 8 + (Math.random() - 0.5) * 0.25;
+        const speed = 24 + Math.random() * 28;
+        state.hitPuffs.push({
+          x,
+          y,
+          team,
+          vx: Math.cos(a) * speed,
+          vy: Math.sin(a) * speed * 0.5,
+          life: 0.28 + Math.random() * 0.16,
+          r: 3 + Math.random() * 2
+        });
+      }
+    }
+
+    function spawnWallPuffs(x, y) {
+      for (let i = 0; i < 8; i++) {
+        const a = (Math.PI * 2 * i) / 8 + (Math.random() - 0.5) * 0.3;
+        const speed = 20 + Math.random() * 24;
+        state.wallPuffs.push({
+          x,
+          y,
+          vx: Math.cos(a) * speed,
+          vy: Math.sin(a) * speed * 0.5,
+          life: 0.32 + Math.random() * 0.18,
+          r: 3 + Math.random() * 3
+        });
+      }
+    }
+
+    function updateBouncePuffs() {
+      const keep = [];
+      for (const p of state.bouncePuffs) {
+        p.life -= SIM_DT;
+        if (p.life <= 0) continue;
+        p.x += p.vx * SIM_DT;
+        p.y += p.vy * SIM_DT;
+        p.vx *= 0.94;
+        p.vy *= 0.90;
+        keep.push(p);
+      }
+      state.bouncePuffs = keep;
+    }
+
+    function updateHitPuffs() {
+      const keep = [];
+      for (const p of state.hitPuffs) {
+        p.life -= SIM_DT;
+        if (p.life <= 0) continue;
+        p.x += p.vx * SIM_DT;
+        p.y += p.vy * SIM_DT;
+        p.vx *= 0.92;
+        p.vy *= 0.88;
+        keep.push(p);
+      }
+      state.hitPuffs = keep;
+    }
+
+    function updateWallPuffs() {
+      const keep = [];
+      for (const p of state.wallPuffs) {
+        p.life -= SIM_DT;
+        if (p.life <= 0) continue;
+        p.x += p.vx * SIM_DT;
+        p.y += p.vy * SIM_DT;
+        p.vx *= 0.92;
+        p.vy *= 0.88;
+        keep.push(p);
+      }
+      state.wallPuffs = keep;
+    }
+
+    function drawBouncePuffs() {
+      for (const p of state.bouncePuffs) {
+        const alpha = Math.min(0.35, p.life * 1.1);
+        ctx.fillStyle = `rgba(160, 168, 178, ${alpha})`;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y + 1, p.r * (1.1 - p.life * 0.9), 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    function drawHitPuffs() {
+      for (const p of state.hitPuffs) {
+        const alpha = Math.min(0.42, p.life * 1.25);
+        const c = p.team === 0 ? "255, 140, 26" : "47, 191, 73";
+        ctx.fillStyle = `rgba(${c}, ${alpha})`;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r * (1.2 - p.life), 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    function drawWallPuffs() {
+      for (const p of state.wallPuffs) {
+        const alpha = Math.min(0.42, p.life * 1.2);
+        ctx.fillStyle = `rgba(70, 140, 255, ${alpha})`;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.r * (1.15 - p.life * 0.8), 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+
+    function drawPendingPointBanner() {
+      if (!state.pendingPoint) return;
+      ctx.save();
+      ctx.fillStyle = "#00000066";
+      ctx.fillRect(court.x + 90, court.netY - 40, court.w - 180, 80);
+      ctx.strokeStyle = "#ffffff66";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(court.x + 90, court.netY - 40, court.w - 180, 80);
+      ctx.fillStyle = TEAM_COLORS[state.pendingPoint.teamWon];
+      ctx.font = "bold 36px Trebuchet MS";
+      ctx.textAlign = "center";
+      ctx.fillText("POINT", court.x + court.w / 2, court.netY + 13);
+      ctx.restore();
+    }
+
+    function drawCourtScore() {
+      const pointTop = padelPointText(1);
+      const pointBottom = padelPointText(0);
+      const gameTop = String(state.games[1]);
+      const gameBottom = String(state.games[0]);
+      const leftX = court.x + 74;
+      const rightX = court.x + court.w - 74;
+      const topY = court.netY - 42;
+      const bottomY = court.netY + 58;
+
+      ctx.save();
+      ctx.textAlign = "center";
+      ctx.font = "bold 48px Trebuchet MS";
+
+      ctx.fillStyle = "rgba(47, 191, 73, 0.34)";
+      ctx.fillText(pointTop, leftX, topY);
+      ctx.fillText(gameTop, rightX, topY);
+
+      ctx.fillStyle = "rgba(255, 140, 26, 0.34)";
+      ctx.fillText(pointBottom, leftX, bottomY);
+      ctx.fillText(gameBottom, rightX, bottomY);
+      ctx.restore();
+    }
+
+    function drawPlayer(p) {
+      const bodyR = 17;
+      const teamColor = TEAM_COLORS[p.team];
+      const controlled = p.id === state.controlId;
+
+      ctx.save();
+
+      ctx.fillStyle = teamColor;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, bodyR, 0, Math.PI * 2);
+      ctx.fill();
+
+      if (controlled) {
+        ctx.fillStyle = "#111111";
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, bodyR * 0.42, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      ctx.restore();
+    }
+
+    function drawBall() {
+      const b = state.ball;
+      const sz = 7 + b.z * 2.6;
+      const elevated = b.z > 0.2;
+
+      ctx.fillStyle = elevated ? "#fff07d" : "#ffd94f";
+      ctx.beginPath();
+      ctx.arc(b.x, b.y - b.z * 6, sz, 0, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = elevated ? "#00000030" : "#00000066";
+      ctx.beginPath();
+      ctx.ellipse(b.x, b.y, elevated ? 10 : 13, elevated ? 5 : 7, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    function drawServeGuides() {
+      // Servis hedef halkası devre dışı.
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      drawCourt();
+      drawServeGuides();
+      drawBouncePuffs();
+      drawWallPuffs();
+      drawHitPuffs();
+      drawCourtScore();
+      for (const p of state.players) drawPlayer(p);
+      drawBall();
+      drawPendingPointBanner();
+    }
+
+    function clamp(v, min, max) {
+      return Math.max(min, Math.min(max, v));
+    }
+
+    function tick() {
+      state.simTime += SIM_DT;
+      updatePlayers();
+      updateBall();
+      updateBouncePuffs();
+      updateWallPuffs();
+      updateHitPuffs();
+      if (state.pendingPoint) {
+        state.pendingPoint.timeLeft -= SIM_DT;
+        if (state.pendingPoint.timeLeft <= 0) {
+          const p = state.pendingPoint;
+          state.pendingPoint = null;
+          awardPoint(p.teamWon, p.why);
+        }
+      }
+      draw();
+      updateHUD();
+      requestAnimationFrame(tick);
+    }
+
+    canvas.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      const rect = canvas.getBoundingClientRect();
+      const x = ((ev.clientX - rect.left) / rect.width) * canvas.width;
+      const y = ((ev.clientY - rect.top) / rect.height) * canvas.height;
+      const me = state.players[state.controlId];
+
+      if (state.phase === "serve_setup" && !state.pendingPoint) {
+        startServe();
+      }
+
+      if (!insideCourt(x, y)) return;
+      const bnd = movementBoundsFor(me);
+      me.tx = clamp(x, bnd.minX, bnd.maxX);
+      me.ty = clamp(y, bnd.minY, bnd.maxY);
+      state.clickFeedback = "Hedef onaylandı";
+
+      setTimeout(() => {
+        state.clickFeedback = "";
+      }, 900);
+    });
+
+    function init() {
+      mkPlayers();
+      resetToFormation();
+      resetBallForServe();
+      updateHUD();
+      tick();
+    }
+
+    init();
+  </script>
+</body>
+</html>
